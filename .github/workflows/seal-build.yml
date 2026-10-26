@@ -1,0 +1,84 @@
+# Netty 4.1.45.Final ships no GitHub Actions CI; its own build/test entry point is
+# docker/docker-compose.yaml (`./mvnw clean install -Dio.netty.testsuite.badHost=netty.io`
+# on CentOS + JDK 8, with a `-P boringssl` variant). This workflow replays that on a
+# Linux x86_64 runner, scoped to netty-transport-native-epoll and its reactor deps.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MAVEN_OPTS: -Xmx2g
+      SKIPS: >-
+        -Dcheckstyle.skip=true -Danimal.sniffer.skip=true -Dforbiddenapis.skip=true
+        -Djapicmp.skip=true -DskipJapicmp=true -Drevapi.skip=true -Dxml.skip=true
+        -Dmaven.javadoc.skip=true -Dmaven.source.skip=true -Dgpg.skip=true -Drat.skip=true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+          cache: maven
+
+      - name: Install native toolchain
+        run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool make gcc
+
+      - name: Build netty-transport-native-epoll and its reactor dependencies
+        run: ./mvnw -B -e -Pboringssl clean install -pl transport-native-epoll -am -DskipTests $SKIPS
+
+      - name: Test transport-native-unix-common and transport-native-epoll
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          FILTER_ARGS=""
+          if [ -n "$TEST_FILTER" ]; then
+            FILTER_ARGS="-Dtest=$TEST_FILTER -DfailIfNoTests=false"
+          fi
+          # install, not test: epoll unpacks unix-common's packaged native static lib (MDEP-98)
+          ./mvnw -B -e -Pboringssl install -pl transport-native-unix-common,transport-native-epoll \
+            -Dio.netty.testsuite.badHost=netty.io $SKIPS $FILTER_ARGS
+
+      - name: List skipped tests with their reasons
+        if: always()
+        run: |
+          shopt -s nullglob
+          reports="transport-native-epoll/target/surefire-reports/TEST-*.xml transport-native-unix-common/target/surefire-reports/TEST-*.xml"
+          echo "== Skipped tests (testcase, then its surefire skip entry) =="
+          awk '/<testcase/ {tc=$0} /<skipped/ {print tc; print "    " $0}' $reports /dev/null
+          echo "== Skip reasons: the Assume/@Ignore guards in the source of each class with a skipped test (and its testsuite superclass) =="
+          echo "NOTE: tests run against netty-tcnative-boringssl-static (-Pboringssl, upstream docker-compose test-boringssl-static);"
+          echo "      BoringSSL does not support TLS renegotiation, so *SslClientRenegotiateTest skips itself via Assume.assumeFalse(\"BoringSSL\".equals(OpenSsl.versionString()))."
+          for cls in $(awk '/<testcase/ {tc=$0} /<skipped/ {print tc}' $reports /dev/null | grep -o 'classname="[^"]*"' | cut -d'"' -f2 | sort -u); do
+            src=$(find transport-native-epoll/src/test transport-native-unix-common/src/test -name "${cls##*.}.java" | head -n1)
+            [ -n "$src" ] || continue
+            files="$src"
+            parent=$(awk 'match($0, /extends [A-Za-z0-9_]+/) {print substr($0, RSTART + 8, RLENGTH - 8); exit}' "$src")
+            if [ -n "$parent" ]; then
+              files="$files $(find testsuite/src transport-native-unix-common-tests/src transport-native-epoll/src/test -name "$parent.java")"
+            fi
+            for f in $files; do
+              echo "--- $cls: $f"
+              awk 'p {print FILENAME ":" FNR ": " $0; p=0} /Assume\.|@Ignore/ {print FILENAME ":" FNR-1 ": " prev; print FILENAME ":" FNR ": " $0; p=1} {prev=$0}' "$f"
+            done
+          done
+
+      - name: Upload release jars
+        uses: actions/upload-artifact@v4
+        with:
+          name: netty-transport-native-epoll-jars
+          if-no-files-found: error
+          path: |
+            transport-native-epoll/target/netty-transport-native-epoll-4.1.45.Final.jar
+            transport-native-epoll/target/netty-transport-native-epoll-4.1.45.Final-linux-x86_64.jar
+            transport-native-epoll/target/netty-transport-native-epoll-4.1.45.Final-tests.jar
